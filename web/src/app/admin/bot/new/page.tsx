@@ -24,7 +24,7 @@ async function Page() {
   ] = (await Promise.all(tasks)) as [
     Response,
     FetchAssistantsResponse,
-    Response
+    Response,
   ];
 
   if (!documentSetsResponse.ok) {
