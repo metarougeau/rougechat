@@ -33,7 +33,7 @@ async function Page({ params }: { params: { id: string } }) {
     Response,
     Response,
     FetchAssistantsResponse,
-    Response,
+    Response
   ];
 
   if (!slackBotsResponse.ok) {
@@ -101,7 +101,7 @@ async function Page({ params }: { params: { id: string } }) {
 
       <Text className="mb-8">
         Edit the existing configuration below! This config will determine how
-        DanswerBot behaves in the specified channels.
+        RougeChatBot behaves in the specified channels.
       </Text>
 
       <SlackBotCreationForm

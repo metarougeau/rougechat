@@ -24,7 +24,7 @@ async function Page() {
   ] = (await Promise.all(tasks)) as [
     Response,
     FetchAssistantsResponse,
-    Response,
+    Response
   ];
 
   if (!documentSetsResponse.ok) {
@@ -68,7 +68,7 @@ async function Page() {
 
       <Text className="mb-8">
         Define a new configuration below! This config will determine how
-        DanswerBot behaves in the specified channels.
+        RougeChatBot behaves in the specified channels.
       </Text>
 
       <SlackBotCreationForm
