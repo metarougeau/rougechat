@@ -126,4 +126,4 @@ To try the Danswer Enterprise Edition:
   2. For self-hosting, contact us at [founders@danswer.ai](mailto:founders@danswer.ai) or book a call with us on our [Cal](https://cal.com/team/danswer/founders).
 
 ## 💡 Contributing
-Looking to contribute? Please check out the [Contribution Guide](CONTRIBUTING.md) for more details.
+Looking to contribute? Please check out the [Contribution Guide](CONTRIBUTING.md) for more details
