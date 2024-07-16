@@ -440,131 +440,43 @@ function Main() {
             </Modal>
           )}
 
-      {isCancelling && (
-        <Modal
-          onOutsideClick={() => setIsCancelling(false)}
-          title="Cancel Embedding Model Switch"
-        >
-          <div>
-            <div>
-              Are you sure you want to cancel?
-              <br />
-              <br />
-              Cancelling will revert to the previous model and all progress will
-              be lost.
-            </div>
-            <div className="flex">
-              <Button onClick={onCancel} className="mt-3 mx-auto" color="green">
-                Confirm
-              </Button>
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      <Text>
-        Embedding models are used to generate embeddings for your documents,
-        which then power RougeChat&apos;s search.
-      </Text>
-
-      {currentModel ? (
-        <>
-          <Title className="mt-8 mb-2">Current Embedding Model</Title>
-
-          <Text>
-            <ModelOption model={currentModel} />
-          </Text>
-        </>
-      ) : (
-        newModelSelection &&
-        (!connectors || !connectors.length) && (
-          <>
-            <Title className="mt-8 mb-2">Current Embedding Model</Title>
-
-            <Text>
-              <ModelOption model={newModelSelection} />
-            </Text>
-          </>
-        )
-      )}
-
-      {!showAddConnectorPopup &&
-        (!newModelSelection ? (
-          <div>
-            {currentModel ? (
-              <>
-                <Title className="mt-8">Switch your Embedding Model</Title>
-
-                <Text className="mb-4">
-                  If the current model is not working for you, you can update
-                  your model choice below. Note that this will require a
-                  complete re-indexing of all your documents across every
-                  connected source. We will take care of this in the background,
-                  but depending on the size of your corpus, this could take
-                  hours, day, or even weeks. You can monitor the progress of the
-                  re-indexing on this page.
-                </Text>
-              </>
-            ) : (
-              <>
-                <Title className="mt-8 mb-4">Choose your Embedding Model</Title>
-              </>
-            )}
-
-            <Text className="mb-4">
-              Below are a curated selection of quality models that we recommend
-              you choose from.
-            </Text>
-
-            <ModelSelector
-              modelOptions={AVAILABLE_MODELS.filter(
-                (modelOption) => modelOption.model_name !== currentModelName
-              )}
-              setSelectedModel={onSelect}
-            />
-
-            <Text className="mt-6">
-              Alternatively, (if you know what you&apos;re doing) you can
-              specify a{" "}
-              <a
-                target="_blank"
-                href="https://www.sbert.net/"
-                className="text-link"
-              >
-                SentenceTransformers
-              </a>
-              -compatible model of your choice below. The rough list of
-              supported models can be found{" "}
-              <a
-                target="_blank"
-                href="https://huggingface.co/models?library=sentence-transformers&sort=trending"
-                className="text-link"
-              >
-                here
-              </a>
-              .
-              <br />
-              <b>NOTE:</b> not all models listed will work with RougeChat, since
-              some have unique interfaces or special requirements. If in doubt,
-              reach out to the RougeChat team.
-            </Text>
-
-            <div className="w-full flex">
-              <Card className="mt-4 2xl:w-4/6 mx-auto">
-                <CustomModelForm onSubmit={onSelect} />
-              </Card>
-            </div>
-          </div>
-        ) : (
-          connectors &&
-          connectors.length > 0 && (
-            <div>
-              <Title className="mt-8">Current Upgrade Status</Title>
-              <div className="mt-4">
-                <div className="italic text-sm mb-2">
-                  Currently in the process of switching to:
+          {isCancelling && (
+            <Modal
+              onOutsideClick={() => setIsCancelling(false)}
+              title="Cancel Embedding Model Switch"
+            >
+              <div>
+                <div>
+                  Are you sure you want to cancel?
+                  <br />
+                  <br />
+                  Cancelling will revert to the previous model and all progress
+                  will be lost.
                 </div>
-                <ModelOption model={newModelSelection} />
+                <div className="flex">
+                  <Button
+                    onClick={onCancel}
+                    className="mt-3 mx-auto"
+                    color="green"
+                  >
+                    Confirm
+                  </Button>
+                </div>
+              </div>
+            </Modal>
+          )}
+        </>
+      )}
+
+      {futureEmbeddingModel && connectors && connectors.length > 0 && (
+        <div>
+          <Title className="mt-8">Current Upgrade Status</Title>
+          <div className="mt-4">
+            <div className="italic text-lg mb-2">
+              Currently in the process of switching to:{" "}
+              {futureEmbeddingModel.model_name}
+            </div>
+            {/* <ModelOption model={futureEmbeddingModel} /> */}
 
             <Button
               color="red"
