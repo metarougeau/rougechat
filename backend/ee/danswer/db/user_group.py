@@ -2,19 +2,22 @@ from collections.abc import Sequence
 from operator import and_
 from uuid import UUID
 
+from sqlalchemy import delete
 from sqlalchemy import func
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from danswer.db.connector_credential_pair import get_connector_credential_pair_from_id
+from danswer.db.enums import ConnectorCredentialPairStatus
 from danswer.db.models import ConnectorCredentialPair
 from danswer.db.models import Document
 from danswer.db.models import DocumentByConnectorCredentialPair
+from danswer.db.models import LLMProvider__UserGroup
 from danswer.db.models import TokenRateLimit__UserGroup
 from danswer.db.models import User
 from danswer.db.models import User__UserGroup
 from danswer.db.models import UserGroup
 from danswer.db.models import UserGroup__ConnectorCredentialPair
-from danswer.server.documents.models import ConnectorCredentialPairIdentifier
 from ee.danswer.server.user_group.models import UserGroupCreate
 from ee.danswer.server.user_group.models import UserGroupUpdate
 
@@ -89,7 +92,6 @@ def fetch_documents_for_user_group_paginated(
 def fetch_user_groups_for_documents(
     db_session: Session,
     document_ids: list[str],
-    cc_pair_to_delete: ConnectorCredentialPairIdentifier | None = None,
 ) -> Sequence[tuple[int, list[str]]]:
     stmt = (
         select(Document.id, func.array_agg(UserGroup.name))
@@ -113,18 +115,11 @@ def fetch_user_groups_for_documents(
         .join(Document, Document.id == DocumentByConnectorCredentialPair.id)
         .where(Document.id.in_(document_ids))
         .where(UserGroup__ConnectorCredentialPair.is_current == True)  # noqa: E712
+        # don't include CC pairs that are being deleted
+        # NOTE: CC pairs can never go from DELETING to any other state -> it's safe to ignore them
+        .where(ConnectorCredentialPair.status != ConnectorCredentialPairStatus.DELETING)
         .group_by(Document.id)
     )
-
-    # pretend that the specified cc pair doesn't exist
-    if cc_pair_to_delete is not None:
-        stmt = stmt.where(
-            and_(
-                ConnectorCredentialPair.connector_id != cc_pair_to_delete.connector_id,
-                ConnectorCredentialPair.credential_id
-                != cc_pair_to_delete.credential_id,
-            )
-        )
 
     return db_session.execute(stmt).all()  # type: ignore
 
@@ -192,6 +187,15 @@ def _cleanup_user__user_group_relationships__no_commit(
     ).all()
     for user__user_group_relationship in user__user_group_relationships:
         db_session.delete(user__user_group_relationship)
+
+
+def _cleanup_llm_provider__user_group_relationships__no_commit(
+    db_session: Session, user_group_id: int
+) -> None:
+    """NOTE: does not commit the transaction."""
+    db_session.query(LLMProvider__UserGroup).filter(
+        LLMProvider__UserGroup.user_group_id == user_group_id
+    ).delete(synchronize_session=False)
 
 
 def _mark_user_group__cc_pair_relationships_outdated__no_commit(
@@ -316,6 +320,9 @@ def mark_user_group_as_synced(db_session: Session, user_group: UserGroup) -> Non
 
 
 def delete_user_group(db_session: Session, user_group: UserGroup) -> None:
+    _cleanup_llm_provider__user_group_relationships__no_commit(
+        db_session=db_session, user_group_id=user_group.id
+    )
     _cleanup_user__user_group_relationships__no_commit(
         db_session=db_session, user_group_id=user_group.id
     )
@@ -330,3 +337,25 @@ def delete_user_group(db_session: Session, user_group: UserGroup) -> None:
 
     db_session.delete(user_group)
     db_session.commit()
+
+
+def delete_user_group_cc_pair_relationship__no_commit(
+    cc_pair_id: int, db_session: Session
+) -> None:
+    """Deletes all rows from UserGroup__ConnectorCredentialPair where the
+    connector_credential_pair_id matches the given cc_pair_id.
+
+    Should be used very carefully (only for connectors that are being deleted)."""
+    cc_pair = get_connector_credential_pair_from_id(cc_pair_id, db_session)
+    if not cc_pair:
+        raise ValueError(f"Connector Credential Pair '{cc_pair_id}' does not exist")
+
+    if cc_pair.status != ConnectorCredentialPairStatus.DELETING:
+        raise ValueError(
+            f"Connector Credential Pair '{cc_pair_id}' is not in the DELETING state"
+        )
+
+    delete_stmt = delete(UserGroup__ConnectorCredentialPair).where(
+        UserGroup__ConnectorCredentialPair.cc_pair_id == cc_pair_id,
+    )
+    db_session.execute(delete_stmt)

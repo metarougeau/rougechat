@@ -51,7 +51,8 @@ from danswer.llm.exceptions import GenAIDisabledException
 from danswer.llm.factory import get_llms_for_persona
 from danswer.llm.factory import get_main_llm_from_tuple
 from danswer.llm.interfaces import LLMConfig
-from danswer.llm.utils import get_default_llm_tokenizer
+from danswer.natural_language_processing.utils import get_tokenizer
+from danswer.search.enums import LLMEvaluationType
 from danswer.search.enums import OptionalSearchSetting
 from danswer.search.enums import QueryFlow
 from danswer.search.enums import SearchType
@@ -60,6 +61,7 @@ from danswer.search.retrieval.search_runner import inference_sections_from_ids
 from danswer.search.utils import chunks_or_sections_to_search_docs
 from danswer.search.utils import dedupe_documents
 from danswer.search.utils import drop_llm_indices
+from danswer.search.utils import relevant_sections_to_indices
 from danswer.server.query_and_chat.models import ChatMessageDetail
 from danswer.server.query_and_chat.models import CreateChatMessageRequest
 from danswer.server.utils import get_json_line
@@ -178,7 +180,7 @@ def _handle_internet_search_tool_response_summary(
             rephrased_query=internet_search_response.revised_query,
             top_documents=response_docs,
             predicted_flow=QueryFlow.QUESTION_ANSWER,
-            predicted_search=SearchType.HYBRID,
+            predicted_search=SearchType.SEMANTIC,
             applied_source_filters=[],
             applied_time_cutoff=None,
             recency_bias_multiplier=1.0,
@@ -187,37 +189,46 @@ def _handle_internet_search_tool_response_summary(
     )
 
 
-def _check_should_force_search(
-    new_msg_req: CreateChatMessageRequest,
-) -> ForceUseTool | None:
-    # If files are already provided, don't run the search tool
+def _get_force_search_settings(
+    new_msg_req: CreateChatMessageRequest, tools: list[Tool]
+) -> ForceUseTool:
+    internet_search_available = any(
+        isinstance(tool, InternetSearchTool) for tool in tools
+    )
+    search_tool_available = any(isinstance(tool, SearchTool) for tool in tools)
+
+    if not internet_search_available and not search_tool_available:
+        # Does not matter much which tool is set here as force is false and neither tool is available
+        return ForceUseTool(force_use=False, tool_name=SearchTool._NAME)
+
+    tool_name = SearchTool._NAME if search_tool_available else InternetSearchTool._NAME
+    # Currently, the internet search tool does not support query override
+    args = (
+        {"query": new_msg_req.query_override}
+        if new_msg_req.query_override and tool_name == SearchTool._NAME
+        else None
+    )
+
     if new_msg_req.file_descriptors:
-        return None
+        # If user has uploaded files they're using, don't run any of the search tools
+        return ForceUseTool(force_use=False, tool_name=tool_name)
 
-    if (
-        new_msg_req.query_override
-        or (
+    should_force_search = any(
+        [
             new_msg_req.retrieval_options
-            and new_msg_req.retrieval_options.run_search == OptionalSearchSetting.ALWAYS
-        )
-        or new_msg_req.search_doc_ids
-        or DISABLE_LLM_CHOOSE_SEARCH
-    ):
-        args = (
-            {"query": new_msg_req.query_override}
-            if new_msg_req.query_override
-            else None
-        )
-        # if we are using selected docs, just put something here so the Tool doesn't need
-        # to build its own args via an LLM call
-        if new_msg_req.search_doc_ids:
-            args = {"query": new_msg_req.message}
+            and new_msg_req.retrieval_options.run_search
+            == OptionalSearchSetting.ALWAYS,
+            new_msg_req.search_doc_ids,
+            DISABLE_LLM_CHOOSE_SEARCH,
+        ]
+    )
 
-        return ForceUseTool(
-            tool_name=SearchTool._NAME,
-            args=args,
-        )
-    return None
+    if should_force_search:
+        # If we are using selected docs, just put something here so the Tool doesn't need to build its own args via an LLM call
+        args = {"query": new_msg_req.message} if new_msg_req.search_doc_ids else args
+        return ForceUseTool(force_use=True, tool_name=tool_name, args=args)
+
+    return ForceUseTool(force_use=False, tool_name=tool_name, args=args)
 
 
 ChatPacket = (
@@ -253,7 +264,6 @@ def stream_chat_message_objects(
     2. [conditional] LLM selected chunk indices if LLM chunk filtering is turned on
     3. [always] A set of streamed LLM tokens or an error anywhere along the line if something fails
     4. [always] Details on the final AI response message that is created
-
     """
     try:
         user_id = user.id if user is not None else None
@@ -274,7 +284,10 @@ def stream_chat_message_objects(
         # use alternate persona if alternative assistant id is passed in
         if alternate_assistant_id is not None:
             persona = get_persona_by_id(
-                alternate_assistant_id, user=user, db_session=db_session
+                alternate_assistant_id,
+                user=user,
+                db_session=db_session,
+                is_for_edit=False,
             )
         else:
             persona = chat_session.persona
@@ -297,7 +310,13 @@ def stream_chat_message_objects(
         except GenAIDisabledException:
             raise RuntimeError("LLM is disabled. Can't use chat flow without LLM.")
 
-        llm_tokenizer = get_default_llm_tokenizer()
+        llm_provider = llm.config.model_provider
+        llm_model_name = llm.config.model_name
+
+        llm_tokenizer = get_tokenizer(
+            model_name=llm_model_name,
+            provider_type=llm_provider,
+        )
         llm_tokenizer_encode_func = cast(
             Callable[[str], list[int]], llm_tokenizer.encode
         )
@@ -360,6 +379,14 @@ def stream_chat_message_objects(
                     "`stream_chat_message_objects` with `is_regenerate=True` "
                     "when the last message is not a user message."
                 )
+
+        # Disable Query Rephrasing for the first message
+        # This leads to a better first response since the LLM rephrasing the question
+        # leads to worst search quality
+        if not history_msgs:
+            new_msg_req.query_override = (
+                new_msg_req.query_override or new_msg_req.message
+            )
 
         # load all files needed for this chat chain in memory
         files = load_all_chat_files(
@@ -476,6 +503,9 @@ def stream_chat_message_objects(
                         chunks_above=new_msg_req.chunks_above,
                         chunks_below=new_msg_req.chunks_below,
                         full_doc=new_msg_req.full_doc,
+                        evaluation_type=LLMEvaluationType.BASIC
+                        if persona.llm_relevance_filter
+                        else LLMEvaluationType.SKIP,
                     )
                     tool_dict[db_tool_model.id] = [search_tool]
                 elif tool_cls.__name__ == ImageGenerationTool.__name__:
@@ -544,9 +574,11 @@ def stream_chat_message_objects(
             tools.extend(tool_list)
 
         # factor in tool definition size when pruning
-        document_pruning_config.tool_num_tokens = compute_all_tool_tokens(tools)
+        document_pruning_config.tool_num_tokens = compute_all_tool_tokens(
+            tools, llm_tokenizer
+        )
         document_pruning_config.using_tool_message = explicit_tool_calling_supported(
-            llm.config.model_provider, llm.config.model_name
+            llm_provider, llm_model_name
         )
 
         # LLM prompt building, response capturing, etc.
@@ -576,11 +608,7 @@ def stream_chat_message_objects(
                 PreviousMessage.from_chat_message(msg, files) for msg in history_msgs
             ],
             tools=tools,
-            force_use_tool=(
-                _check_should_force_search(new_msg_req)
-                if search_tool and len(tools) == 1
-                else None
-            ),
+            force_use_tool=_get_force_search_settings(new_msg_req, tools),
         )
 
         reference_db_search_docs = None
@@ -606,18 +634,28 @@ def stream_chat_message_objects(
                     )
                     yield qa_docs_response
                 elif packet.id == SECTION_RELEVANCE_LIST_ID:
-                    chunk_indices = packet.response
+                    relevance_sections = packet.response
 
-                    if reference_db_search_docs is not None and dropped_indices:
-                        chunk_indices = drop_llm_indices(
-                            llm_indices=chunk_indices,
-                            search_docs=reference_db_search_docs,
-                            dropped_indices=dropped_indices,
+                    if reference_db_search_docs is not None:
+                        llm_indices = relevant_sections_to_indices(
+                            relevance_sections=relevance_sections,
+                            items=[
+                                translate_db_search_doc_to_server_search_doc(doc)
+                                for doc in reference_db_search_docs
+                            ],
                         )
 
-                    yield LLMRelevanceFilterResponse(
-                        relevant_chunk_indices=chunk_indices
-                    )
+                        if dropped_indices:
+                            llm_indices = drop_llm_indices(
+                                llm_indices=llm_indices,
+                                search_docs=reference_db_search_docs,
+                                dropped_indices=dropped_indices,
+                            )
+
+                        yield LLMRelevanceFilterResponse(
+                            relevant_chunk_indices=llm_indices
+                        )
+
                 elif packet.id == IMAGE_GENERATION_RESPONSE_ID:
                     img_generation_response = cast(
                         list[ImageGenerationResponse], packet.response
@@ -655,18 +693,29 @@ def stream_chat_message_objects(
                 yield cast(ChatPacket, packet)
 
     except Exception as e:
-        logger.exception("Failed to process chat message")
-
-        # Don't leak the API key
         error_msg = str(e)
-        if llm.config.api_key and llm.config.api_key.lower() in error_msg.lower():
+
+        logger.exception(f"Failed to process chat message: {error_msg}")
+
+        if "Illegal header value b'Bearer  '" in error_msg:
             error_msg = (
-                f"LLM failed to respond. Invalid API "
-                f"key error from '{llm.config.model_provider}'."
+                f"Authentication error: Invalid or empty API key provided for '{llm.config.model_provider}'. "
+                "Please check your API key configuration."
             )
+        elif (
+            "Invalid leading whitespace, reserved character(s), or return character(s) in header value"
+            in error_msg
+        ):
+            error_msg = (
+                f"Authentication error: Invalid API key format for '{llm.config.model_provider}'. "
+                "Please ensure your API key does not contain leading/trailing whitespace or invalid characters."
+            )
+        elif llm.config.api_key and llm.config.api_key.lower() in error_msg.lower():
+            error_msg = f"LLM failed to respond. Invalid API key error from '{llm.config.model_provider}'."
+        else:
+            error_msg = "An unexpected error occurred while processing your request. Please try again later."
 
         yield StreamingError(error=error_msg)
-        # Cancel the transaction so that no messages are saved
         db_session.rollback()
         return
 

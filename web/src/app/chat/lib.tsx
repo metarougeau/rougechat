@@ -27,6 +27,37 @@ import {
 import { Persona } from "../admin/assistants/interfaces";
 import { ReadonlyURLSearchParams } from "next/navigation";
 import { SEARCH_PARAM_NAMES } from "./searchParams";
+import { Settings } from "../admin/settings/interfaces";
+
+interface ChatRetentionInfo {
+  chatRetentionDays: number;
+  daysFromCreation: number;
+  daysUntilExpiration: number;
+  showRetentionWarning: boolean;
+}
+
+export function getChatRetentionInfo(
+  chatSession: ChatSession,
+  settings: Settings
+): ChatRetentionInfo {
+  // If `maximum_chat_retention_days` isn't set- never display retention warning.
+  const chatRetentionDays = settings.maximum_chat_retention_days || 10000;
+  const createdDate = new Date(chatSession.time_created);
+  const today = new Date();
+  const daysFromCreation = Math.ceil(
+    (today.getTime() - createdDate.getTime()) / (1000 * 3600 * 24)
+  );
+  const daysUntilExpiration = chatRetentionDays - daysFromCreation;
+  const showRetentionWarning =
+    chatRetentionDays < 7 ? daysUntilExpiration < 2 : daysUntilExpiration < 7;
+
+  return {
+    chatRetentionDays,
+    daysFromCreation,
+    daysUntilExpiration,
+    showRetentionWarning,
+  };
+}
 
 export async function updateModelOverrideForChatSession(
   chatSessionId: number,
@@ -505,7 +536,7 @@ export function removeMessage(
 
 export function checkAnyAssistantHasSearch(
   messageHistory: Message[],
-  availablePersonas: Persona[],
+  availableAssistants: Persona[],
   livePersona: Persona
 ): boolean {
   const response =
@@ -516,11 +547,9 @@ export function checkAnyAssistantHasSearch(
       ) {
         return false;
       }
-
-      const alternateAssistant = availablePersonas.find(
-        (persona) => persona.id === message.alternateAssistantID
+      const alternateAssistant = availableAssistants.find(
+        (assistant) => assistant.id === message.alternateAssistantID
       );
-
       return alternateAssistant
         ? personaIncludesRetrieval(alternateAssistant)
         : false;
@@ -537,6 +566,13 @@ export function personaIncludesRetrieval(selectedPersona: Persona) {
   );
 }
 
+export function personaIncludesImage(selectedPersona: Persona) {
+  return selectedPersona.tools.some(
+    (tool) =>
+      tool.in_code_tool_id && tool.in_code_tool_id == "ImageGenerationTool"
+  );
+}
+
 const PARAMS_TO_SKIP = [
   SEARCH_PARAM_NAMES.SUBMIT_ON_LOAD,
   SEARCH_PARAM_NAMES.USER_MESSAGE,
@@ -549,11 +585,16 @@ const PARAMS_TO_SKIP = [
 export function buildChatUrl(
   existingSearchParams: ReadonlyURLSearchParams,
   chatSessionId: number | null,
-  personaId: number | null
+  personaId: number | null,
+  search?: boolean
 ) {
   const finalSearchParams: string[] = [];
   if (chatSessionId) {
-    finalSearchParams.push(`${SEARCH_PARAM_NAMES.CHAT_ID}=${chatSessionId}`);
+    finalSearchParams.push(
+      `${
+        search ? SEARCH_PARAM_NAMES.SEARCH_ID : SEARCH_PARAM_NAMES.CHAT_ID
+      }=${chatSessionId}`
+    );
   }
   if (personaId !== null) {
     finalSearchParams.push(`${SEARCH_PARAM_NAMES.PERSONA_ID}=${personaId}`);
@@ -567,10 +608,10 @@ export function buildChatUrl(
   const finalSearchParamsString = finalSearchParams.join("&");
 
   if (finalSearchParamsString) {
-    return `/chat?${finalSearchParamsString}`;
+    return `/${search ? "search" : "chat"}?${finalSearchParamsString}`;
   }
 
-  return "/chat";
+  return `/${search ? "search" : "chat"}`;
 }
 
 export async function uploadFilesForChat(
@@ -607,6 +648,7 @@ export async function useScrollonStream({
   endDivRef: RefObject<HTMLDivElement>;
   distance: number;
   debounce: number;
+  mobile?: boolean;
 }) {
   const preventScrollInterference = useRef<boolean>(false);
   const preventScroll = useRef<boolean>(false);
@@ -671,7 +713,7 @@ export async function useScrollonStream({
   // scroll on end of stream if within distance
   useEffect(() => {
     if (scrollableDivRef?.current && !isStreaming) {
-      if (scrollDist.current < distance) {
+      if (scrollDist.current < distance - 50) {
         scrollableDivRef?.current?.scrollBy({
           left: 0,
           top: Math.max(scrollDist.current + 600, 0),

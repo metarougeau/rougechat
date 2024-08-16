@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from danswer.configs.app_configs import MASK_CREDENTIAL_PREFIX
 from danswer.configs.constants import DocumentSource
 from danswer.connectors.models import InputType
+from danswer.db.enums import ConnectorCredentialPairStatus
 from danswer.db.models import Connector
 from danswer.db.models import ConnectorCredentialPair
 from danswer.db.models import Credential
@@ -24,6 +25,94 @@ class DocumentInfo(BaseModel):
 class ChunkInfo(BaseModel):
     content: str
     num_tokens: int
+
+
+class DeletionAttemptSnapshot(BaseModel):
+    connector_id: int
+    credential_id: int
+    status: TaskStatus
+
+
+class ConnectorBase(BaseModel):
+    name: str
+    source: DocumentSource
+    input_type: InputType
+    connector_specific_config: dict[str, Any]
+    refresh_freq: int | None  # In seconds, None for one time index with no refresh
+    prune_freq: int | None
+    indexing_start: datetime | None
+
+
+class ConnectorCredentialBase(ConnectorBase):
+    is_public: bool
+
+
+class ConnectorSnapshot(ConnectorBase):
+    id: int
+    credential_ids: list[int]
+    time_created: datetime
+    time_updated: datetime
+    source: DocumentSource
+
+    @classmethod
+    def from_connector_db_model(cls, connector: Connector) -> "ConnectorSnapshot":
+        return ConnectorSnapshot(
+            id=connector.id,
+            name=connector.name,
+            source=connector.source,
+            input_type=connector.input_type,
+            connector_specific_config=connector.connector_specific_config,
+            refresh_freq=connector.refresh_freq,
+            prune_freq=connector.prune_freq,
+            credential_ids=[
+                association.credential.id for association in connector.credentials
+            ],
+            indexing_start=connector.indexing_start,
+            time_created=connector.time_created,
+            time_updated=connector.time_updated,
+        )
+
+
+class CredentialSwapRequest(BaseModel):
+    new_credential_id: int
+    connector_id: int
+
+
+class CredentialDataUpdateRequest(BaseModel):
+    name: str
+    credential_json: dict[str, Any]
+
+
+class CredentialBase(BaseModel):
+    credential_json: dict[str, Any]
+    # if `true`, then all Admins will have access to the credential
+    admin_public: bool
+    source: DocumentSource
+    name: str | None = None
+
+
+class CredentialSnapshot(CredentialBase):
+    id: int
+    user_id: UUID | None
+    time_created: datetime
+    time_updated: datetime
+
+    @classmethod
+    def from_credential_db_model(cls, credential: Credential) -> "CredentialSnapshot":
+        return CredentialSnapshot(
+            id=credential.id,
+            credential_json=(
+                mask_credential_dict(credential.credential_json)
+                if MASK_CREDENTIAL_PREFIX
+                else credential.credential_json
+            ),
+            user_id=credential.user_id,
+            admin_public=credential.admin_public,
+            time_created=credential.time_created,
+            time_updated=credential.time_updated,
+            source=credential.source or DocumentSource.NOT_APPLICABLE,
+            name=credential.name,
+        )
 
 
 class IndexAttemptSnapshot(BaseModel):
@@ -49,83 +138,19 @@ class IndexAttemptSnapshot(BaseModel):
             docs_removed_from_index=index_attempt.docs_removed_from_index or 0,
             error_msg=index_attempt.error_msg,
             full_exception_trace=index_attempt.full_exception_trace,
-            time_started=index_attempt.time_started.isoformat()
-            if index_attempt.time_started
-            else None,
+            time_started=(
+                index_attempt.time_started.isoformat()
+                if index_attempt.time_started
+                else None
+            ),
             time_updated=index_attempt.time_updated.isoformat(),
-        )
-
-
-class DeletionAttemptSnapshot(BaseModel):
-    connector_id: int
-    credential_id: int
-    status: TaskStatus
-
-
-class ConnectorBase(BaseModel):
-    name: str
-    source: DocumentSource
-    input_type: InputType
-    connector_specific_config: dict[str, Any]
-    refresh_freq: int | None  # In seconds, None for one time index with no refresh
-    prune_freq: int | None
-    disabled: bool
-
-
-class ConnectorSnapshot(ConnectorBase):
-    id: int
-    credential_ids: list[int]
-    time_created: datetime
-    time_updated: datetime
-
-    @classmethod
-    def from_connector_db_model(cls, connector: Connector) -> "ConnectorSnapshot":
-        return ConnectorSnapshot(
-            id=connector.id,
-            name=connector.name,
-            source=connector.source,
-            input_type=connector.input_type,
-            connector_specific_config=connector.connector_specific_config,
-            refresh_freq=connector.refresh_freq,
-            prune_freq=connector.prune_freq,
-            credential_ids=[
-                association.credential.id for association in connector.credentials
-            ],
-            time_created=connector.time_created,
-            time_updated=connector.time_updated,
-            disabled=connector.disabled,
-        )
-
-
-class CredentialBase(BaseModel):
-    credential_json: dict[str, Any]
-    # if `true`, then all Admins will have access to the credential
-    admin_public: bool
-
-
-class CredentialSnapshot(CredentialBase):
-    id: int
-    user_id: UUID | None
-    time_created: datetime
-    time_updated: datetime
-
-    @classmethod
-    def from_credential_db_model(cls, credential: Credential) -> "CredentialSnapshot":
-        return CredentialSnapshot(
-            id=credential.id,
-            credential_json=mask_credential_dict(credential.credential_json)
-            if MASK_CREDENTIAL_PREFIX
-            else credential.credential_json,
-            user_id=credential.user_id,
-            admin_public=credential.admin_public,
-            time_created=credential.time_created,
-            time_updated=credential.time_updated,
         )
 
 
 class CCPairFullInfo(BaseModel):
     id: int
     name: str
+    status: ConnectorCredentialPairStatus
     num_docs_indexed: int
     connector: ConnectorSnapshot
     credential: CredentialSnapshot
@@ -143,6 +168,7 @@ class CCPairFullInfo(BaseModel):
         return cls(
             id=cc_pair_model.id,
             name=cc_pair_model.name,
+            status=cc_pair_model.status,
             num_docs_indexed=num_docs_indexed,
             connector=ConnectorSnapshot.from_connector_db_model(
                 cc_pair_model.connector
@@ -163,10 +189,12 @@ class ConnectorIndexingStatus(BaseModel):
 
     cc_pair_id: int
     name: str | None
+    cc_pair_status: ConnectorCredentialPairStatus
     connector: ConnectorSnapshot
     credential: CredentialSnapshot
     owner: str
     public_doc: bool
+    last_finished_status: IndexingStatus | None
     last_status: IndexingStatus | None
     last_success: datetime | None
     docs_indexed: int
@@ -242,6 +270,7 @@ class FileUploadResponse(BaseModel):
 
 class ObjectCreationIdResponse(BaseModel):
     id: int | str
+    credential: CredentialSnapshot | None = None
 
 
 class AuthStatus(BaseModel):

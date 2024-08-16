@@ -1,6 +1,8 @@
 "use client";
 
-import { CCPairBasicInfo, DocumentSet, User, UserGroup } from "@/lib/types";
+import { generateRandomIconShape, createSVG } from "@/lib/assistantIconUtils";
+
+import { CCPairBasicInfo, DocumentSet, User } from "@/lib/types";
 import { Button, Divider, Italic, Text } from "@tremor/react";
 import {
   ArrayHelpers,
@@ -11,39 +13,41 @@ import {
   Formik,
 } from "formik";
 
-import * as Yup from "yup";
-import { buildFinalPrompt, createPersona, updatePersona } from "./lib";
-import { useRouter } from "next/navigation";
-import { usePopup } from "@/components/admin/connectors/Popup";
-import { Persona, StarterMessage } from "./interfaces";
-import Link from "next/link";
-import { useEffect, useState } from "react";
 import {
   BooleanFormField,
   Label,
   SelectorFormField,
   TextFormField,
 } from "@/components/admin/connectors/Field";
-import CollapsibleSection from "./CollapsibleSection";
-import { FiInfo, FiPlus, FiX } from "react-icons/fi";
-import { useUserGroups } from "@/lib/hooks";
+import { usePopup } from "@/components/admin/connectors/Popup";
+import { getDisplayNameForModel } from "@/lib/hooks";
 import { Bubble } from "@/components/Bubble";
-import { GroupsIcon } from "@/components/icons/icons";
-import { SuccessfulPersonaUpdateRedirectType } from "./enums";
 import { DocumentSetSelectable } from "@/components/documentSet/DocumentSetSelectable";
-import { FullLLMProvider } from "../models/llm/interfaces";
 import { Option } from "@/components/Dropdown";
+import { GroupsIcon } from "@/components/icons/icons";
+import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
+import { addAssistantToList } from "@/lib/assistants/updateAssistantPreferences";
+import { useUserGroups } from "@/lib/hooks";
+import { checkLLMSupportsImageInput, destructureValue } from "@/lib/llm/utils";
 import { ToolSnapshot } from "@/lib/tools/interfaces";
 import { checkUserIsNoAuthUser } from "@/lib/user";
-import { addAssistantToList } from "@/lib/assistants/updateAssistantPreferences";
-import { checkLLMSupportsImageInput } from "@/lib/llm/utils";
-import { usePaidEnterpriseFeaturesEnabled } from "@/components/settings/usePaidEnterpriseFeaturesEnabled";
 import {
-  TooltipProvider,
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from "@radix-ui/react-tooltip";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { FiInfo, FiPlus, FiX } from "react-icons/fi";
+import * as Yup from "yup";
+import { FullLLMProvider } from "../models/llm/interfaces";
+import CollapsibleSection from "./CollapsibleSection";
+import { SuccessfulPersonaUpdateRedirectType } from "./enums";
+import { Persona, StarterMessage } from "./interfaces";
+import { buildFinalPrompt, createPersona, updatePersona } from "./lib";
+import { IconImageSelection } from "@/components/assistants/AssistantIconCreation";
 
 function findSearchTool(tools: ToolSnapshot[]) {
   return tools.find((tool) => tool.in_code_tool_id === "SearchTool");
@@ -84,6 +88,24 @@ export function AssistantEditor({
 }) {
   const router = useRouter();
   const { popup, setPopup } = usePopup();
+
+  const colorOptions = [
+    "#FF6FBF",
+    "#6FB1FF",
+    "#B76FFF",
+    "#FFB56F",
+    "#6FFF8D",
+    "#FF6F6F",
+    "#6FFFFF",
+  ];
+
+  // state to persist across formik reformatting
+  const [defautIconColor, _setDeafultIconColor] = useState(
+    colorOptions[Math.floor(Math.random() * colorOptions.length)]
+  );
+  const [defaultIconShape, _setDeafultIconShape] = useState(
+    generateRandomIconShape().encodedGrid
+  );
 
   const isPaidEnterpriseFeaturesEnabled = usePaidEnterpriseFeaturesEnabled();
 
@@ -138,7 +160,7 @@ export function AssistantEditor({
   llmProviders.forEach((llmProvider) => {
     const providerOptions = llmProvider.model_names.map((modelName) => {
       return {
-        name: modelName,
+        name: getDisplayNameForModel(modelName),
         value: modelName,
       };
     });
@@ -192,6 +214,10 @@ export function AssistantEditor({
       existingPersona?.llm_model_version_override ?? null,
     starter_messages: existingPersona?.starter_messages ?? [],
     enabled_tools_map: enabledToolsMap,
+    icon_color: existingPersona?.icon_color ?? defautIconColor,
+    icon_shape: existingPersona?.icon_shape ?? defaultIconShape,
+    uploaded_image: null,
+
     //   search_tool_enabled: existingPersona
     //   ? personaCurrentToolIds.includes(searchTool!.id)
     //   : ccPairs.length > 0,
@@ -232,6 +258,9 @@ export function AssistantEditor({
                 message: Yup.string().required(),
               })
             ),
+            icon_color: Yup.string(),
+            icon_shape: Yup.number(),
+            uploaded_image: Yup.mixed().nullable(),
             // EE Only
             groups: Yup.array().of(Yup.number()),
           })
@@ -277,7 +306,6 @@ export function AssistantEditor({
           }
 
           formikHelpers.setSubmitting(true);
-
           let enabledTools = Object.keys(values.enabled_tools_map)
             .map((toolId) => Number(toolId))
             .filter((toolId) => values.enabled_tools_map[toolId]);
@@ -400,21 +428,77 @@ export function AssistantEditor({
           }
 
           return (
-            <Form>
+            <Form className="w-full">
               <div className="pb-6">
                 <TextFormField
                   name="name"
                   tooltip="Used to identify the Assistant in the UI."
                   label="Name"
-                  disabled={isUpdate}
                   placeholder="e.g. 'Email Assistant'"
                 />
+                <div className="mb-6 ">
+                  <div className="flex gap-x-2 items-center">
+                    <div className="block font-medium text-base">
+                      Assistant Icon{" "}
+                    </div>
+                    <TooltipProvider delayDuration={50}>
+                      <Tooltip>
+                        <TooltipTrigger>
+                          <FiInfo size={12} />
+                        </TooltipTrigger>
+                        <TooltipContent side="top" align="center">
+                          <p className="bg-background-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
+                            Choose an icon to visually represent your Assistant
+                            (optional)
+                          </p>
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+
+                  <div className="flex -mb-2 mt-2 items-center space-x-2">
+                    {createSVG(
+                      {
+                        encodedGrid: values.icon_shape,
+                        filledSquares: 0,
+                      },
+                      values.icon_color
+                    )}
+
+                    <div className="mb-2 flex gap-x-2 items-center">
+                      <Button
+                        onClick={() => {
+                          const newShape = generateRandomIconShape();
+                          setFieldValue("icon_shape", newShape.encodedGrid);
+                          const randomColor =
+                            colorOptions[
+                              Math.floor(Math.random() * colorOptions.length)
+                            ];
+                          setFieldValue("icon_color", randomColor);
+                        }}
+                        color="blue"
+                        size="xs"
+                        type="button"
+                        className="h-full"
+                      >
+                        Regenerate
+                      </Button>
+                    </div>
+                  </div>
+
+                  <IconImageSelection
+                    setFieldValue={setFieldValue}
+                    existingPersona={existingPersona!}
+                  />
+                </div>
+
                 <TextFormField
                   tooltip="Used for identifying assistants and their use cases."
                   name="description"
                   label="Description"
                   placeholder="e.g. 'Use this Assistant to help draft professional emails'"
                 />
+
                 <TextFormField
                   tooltip="Gives your assistant a prime directive"
                   name="system_prompt"
@@ -436,7 +520,7 @@ export function AssistantEditor({
                 <div className="mb-6">
                   <div className="flex gap-x-2 items-center">
                     <div className="block font-medium text-base">
-                      LLM Provider{" "}
+                      LLM Override{" "}
                     </div>
                     <TooltipProvider delayDuration={50}>
                       <Tooltip>
@@ -444,7 +528,7 @@ export function AssistantEditor({
                           <FiInfo size={12} />
                         </TooltipTrigger>
                         <TooltipContent side="top" align="center">
-                          <p className="bg-neutral-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
+                          <p className="bg-background-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
                             Select a Large Language Model (Generative AI model)
                             to power this Assistant
                           </p>
@@ -452,10 +536,16 @@ export function AssistantEditor({
                       </Tooltip>
                     </TooltipProvider>
                   </div>
+                  <p className="my-1 text-text-600">
+                    Your assistant will use the user&apos;s set default unless
+                    otherwise specified below.
+                    {user?.preferences.default_model &&
+                      `  Your current (user-specific) default model is ${getDisplayNameForModel(destructureValue(user?.preferences?.default_model!).modelName)}`}
+                  </p>
                   <div className="mb-2 flex items-starts">
                     <div className="w-96">
                       <SelectorFormField
-                        defaultValue={`Default (${defaultModelName})`}
+                        defaultValue={`User default`}
                         name="llm_model_provider_override"
                         options={llmProviders.map((llmProvider) => ({
                           name: llmProvider.name,
@@ -490,7 +580,6 @@ export function AssistantEditor({
                     )}
                   </div>
                 </div>
-
                 <div className="mb-6">
                   <div className="flex gap-x-2 items-center">
                     <div className="block font-medium text-base">
@@ -502,7 +591,7 @@ export function AssistantEditor({
                           <FiInfo size={12} />
                         </TooltipTrigger>
                         <TooltipContent side="top" align="center">
-                          <p className="bg-neutral-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
+                          <p className="bg-background-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
                             You can give your assistant advanced capabilities
                             like image generation
                           </p>
@@ -514,43 +603,98 @@ export function AssistantEditor({
                     </div>
                   </div>
 
-                  <div className="mt-2 ml-1">
-                    {imageGenerationTool &&
-                      checkLLMSupportsImageInput(
-                        providerDisplayNameToProviderName.get(
-                          values.llm_model_provider_override || ""
-                        ) ||
-                          defaultProviderName ||
-                          "",
-                        values.llm_model_version_override ||
-                          defaultModelName ||
-                          ""
-                      ) && (
-                        <BooleanFormField
-                          noPadding
-                          name={`enabled_tools_map.${imageGenerationTool.id}`}
-                          label="Image Generation Tool"
-                          onChange={() => {
-                            toggleToolInValues(imageGenerationTool.id);
-                          }}
-                        />
-                      )}
+                  <div className="mt-2 flex flex-col  ml-1">
+                    {imageGenerationTool && (
+                      <TooltipProvider delayDuration={50}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div
+                              className={`w-fit ${
+                                !checkLLMSupportsImageInput(
+                                  providerDisplayNameToProviderName.get(
+                                    values.llm_model_provider_override || ""
+                                  ) || "",
+                                  values.llm_model_version_override || ""
+                                )
+                                  ? "opacity-50 cursor-not-allowed"
+                                  : ""
+                              }`}
+                            >
+                              <BooleanFormField
+                                noPadding
+                                name={`enabled_tools_map.${imageGenerationTool.id}`}
+                                label="Image Generation Tool"
+                                onChange={() => {
+                                  toggleToolInValues(imageGenerationTool.id);
+                                }}
+                                disabled={
+                                  !checkLLMSupportsImageInput(
+                                    providerDisplayNameToProviderName.get(
+                                      values.llm_model_provider_override || ""
+                                    ) || "",
+                                    values.llm_model_version_override || ""
+                                  )
+                                }
+                              />
+                            </div>
+                          </TooltipTrigger>
+                          {!checkLLMSupportsImageInput(
+                            providerDisplayNameToProviderName.get(
+                              values.llm_model_provider_override || ""
+                            ) || "",
+                            values.llm_model_version_override || ""
+                          ) && (
+                            <TooltipContent side="top" align="center">
+                              <p className="bg-background-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
+                                To use Image Generation, select GPT-4o as the
+                                default model for this Assistant.
+                              </p>
+                            </TooltipContent>
+                          )}
+                        </Tooltip>
+                      </TooltipProvider>
+                    )}
+
+                    {searchTool && (
+                      <TooltipProvider delayDuration={50}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div
+                              className={`w-fit ${
+                                ccPairs.length === 0
+                                  ? "opacity-50 cursor-not-allowed"
+                                  : ""
+                              }`}
+                            >
+                              <BooleanFormField
+                                name={`enabled_tools_map.${searchTool.id}`}
+                                label="Search Tool"
+                                noPadding
+                                onChange={() => {
+                                  setFieldValue("num_chunks", null);
+                                  toggleToolInValues(searchTool.id);
+                                }}
+                                disabled={ccPairs.length === 0}
+                              />
+                            </div>
+                          </TooltipTrigger>
+                          {ccPairs.length === 0 && (
+                            <TooltipContent side="top" align="center">
+                              <p className="bg-background-900 max-w-[200px] mb-1 text-sm rounded-lg p-1.5 text-white">
+                                To use the Search Tool, you need to have at
+                                least one Connector-Credential pair configured.
+                              </p>
+                            </TooltipContent>
+                          )}
+                        </Tooltip>
+                      </TooltipProvider>
+                    )}
 
                     {ccPairs.length > 0 && searchTool && (
                       <>
-                        <BooleanFormField
-                          name={`enabled_tools_map.${searchTool.id}`}
-                          label="Search Tool"
-                          noPadding
-                          onChange={() => {
-                            setFieldValue("num_chunks", null);
-                            toggleToolInValues(searchTool.id);
-                          }}
-                        />
-
                         {searchToolEnabled() && (
                           <CollapsibleSection prompt="Configure Search">
-                            <div className=" ">
+                            <div>
                               {ccPairs.length > 0 && (
                                 <>
                                   <Label small>Document Sets</Label>
@@ -819,14 +963,14 @@ export function AssistantEditor({
                                         <Field
                                           name={`starter_messages[${index}].message`}
                                           className={`
-                                        border 
-                                        border-border 
-                                        bg-background 
-                                        rounded 
-                                        w-full 
-                                        py-2 
-                                        px-3 
-                                        mr-4
+                                          border 
+                                          border-border 
+                                          bg-background 
+                                          rounded 
+                                          w-full 
+                                          py-2 
+                                          px-3 
+                                          mr-4
                                       `}
                                           as="textarea"
                                           autoComplete="off"

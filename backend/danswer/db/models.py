@@ -11,6 +11,7 @@ from uuid import UUID
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseOAuthAccountTableUUID
 from fastapi_users_db_sqlalchemy import SQLAlchemyBaseUserTableUUID
 from fastapi_users_db_sqlalchemy.access_token import SQLAlchemyBaseAccessTokenTableUUID
+from fastapi_users_db_sqlalchemy.generics import TIMESTAMPAware
 from sqlalchemy import Boolean
 from sqlalchemy import DateTime
 from sqlalchemy import Enum
@@ -37,10 +38,12 @@ from danswer.configs.constants import DEFAULT_BOOST
 from danswer.configs.constants import DocumentSource
 from danswer.configs.constants import FileOrigin
 from danswer.configs.constants import MessageType
+from danswer.configs.constants import NotificationType
 from danswer.configs.constants import SearchFeedbackType
 from danswer.configs.constants import TokenRateLimitScope
 from danswer.connectors.models import InputType
 from danswer.db.enums import ChatSessionSharedStatus
+from danswer.db.enums import ConnectorCredentialPairStatus
 from danswer.db.enums import IndexingStatus
 from danswer.db.enums import IndexModelStatus
 from danswer.db.enums import TaskStatus
@@ -50,9 +53,9 @@ from danswer.file_store.models import FileDescriptor
 from danswer.llm.override_models import LLMOverride
 from danswer.llm.override_models import PromptOverride
 from danswer.search.enums import RecencyBiasSetting
-from danswer.search.enums import SearchType
 from danswer.utils.encryption import decrypt_bytes_to_string
 from danswer.utils.encryption import encrypt_string_to_bytes
+from shared_configs.enums import EmbeddingProvider
 
 
 class Base(DeclarativeBase):
@@ -120,6 +123,14 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
         postgresql.ARRAY(Integer), nullable=True
     )
 
+    oidc_expiry: Mapped[datetime.datetime] = mapped_column(
+        TIMESTAMPAware(timezone=True), nullable=True
+    )
+
+    default_model: Mapped[str] = mapped_column(Text, nullable=True)
+    # organized in typical structured fashion
+    # formatted as `displayName__provider__modelName`
+
     # relationships
     credentials: Mapped[list["Credential"]] = relationship(
         "Credential", back_populates="user", lazy="joined"
@@ -132,10 +143,41 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     )
 
     prompts: Mapped[list["Prompt"]] = relationship("Prompt", back_populates="user")
+    input_prompts: Mapped[list["InputPrompt"]] = relationship(
+        "InputPrompt", back_populates="user"
+    )
+
     # Personas owned by this user
     personas: Mapped[list["Persona"]] = relationship("Persona", back_populates="user")
     # Custom tools created by this user
     custom_tools: Mapped[list["Tool"]] = relationship("Tool", back_populates="user")
+    # Notifications for the UI
+    notifications: Mapped[list["Notification"]] = relationship(
+        "Notification", back_populates="user"
+    )
+
+
+class InputPrompt(Base):
+    __tablename__ = "inputprompt"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt: Mapped[str] = mapped_column(String)
+    content: Mapped[str] = mapped_column(String)
+    active: Mapped[bool] = mapped_column(Boolean)
+    user: Mapped[User | None] = relationship("User", back_populates="input_prompts")
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+
+
+class InputPrompt__User(Base):
+    __tablename__ = "inputprompt__user"
+
+    input_prompt_id: Mapped[int] = mapped_column(
+        ForeignKey("inputprompt.id"), primary_key=True
+    )
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("inputprompt.id"), primary_key=True
+    )
 
 
 class AccessToken(SQLAlchemyBaseAccessTokenTableUUID, Base):
@@ -156,6 +198,24 @@ class ApiKey(Base):
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+    # Add this relationship to access the User object via user_id
+    user: Mapped["User"] = relationship("User", foreign_keys=[user_id])
+
+
+class Notification(Base):
+    __tablename__ = "notification"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    notif_type: Mapped[NotificationType] = mapped_column(
+        Enum(NotificationType, native_enum=False)
+    )
+    user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
+    dismissed: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_shown: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+    first_shown: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True))
+
+    user: Mapped[User] = relationship("User", back_populates="notifications")
 
 
 """
@@ -184,7 +244,9 @@ class Persona__User(Base):
     __tablename__ = "persona__user"
 
     persona_id: Mapped[int] = mapped_column(ForeignKey("persona.id"), primary_key=True)
-    user_id: Mapped[UUID] = mapped_column(ForeignKey("user.id"), primary_key=True)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id"), primary_key=True, nullable=True
+    )
 
 
 class DocumentSet__User(Base):
@@ -193,7 +255,9 @@ class DocumentSet__User(Base):
     document_set_id: Mapped[int] = mapped_column(
         ForeignKey("document_set.id"), primary_key=True
     )
-    user_id: Mapped[UUID] = mapped_column(ForeignKey("user.id"), primary_key=True)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id"), primary_key=True, nullable=True
+    )
 
 
 class DocumentSet__ConnectorCredentialPair(Base):
@@ -301,6 +365,9 @@ class ConnectorCredentialPair(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[ConnectorCredentialPairStatus] = mapped_column(
+        Enum(ConnectorCredentialPairStatus, native_enum=False), nullable=False
+    )
     connector_id: Mapped[int] = mapped_column(
         ForeignKey("connector.id"), primary_key=True
     )
@@ -336,6 +403,9 @@ class ConnectorCredentialPair(Base):
         ),
         back_populates="connector_credential_pairs",
         overlaps="document_set",
+    )
+    index_attempts: Mapped[list["IndexAttempt"]] = relationship(
+        "IndexAttempt", back_populates="connector_credential_pair"
     )
 
 
@@ -416,6 +486,9 @@ class Connector(Base):
     connector_specific_config: Mapped[dict[str, Any]] = mapped_column(
         postgresql.JSONB()
     )
+    indexing_start: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
     refresh_freq: Mapped[int | None] = mapped_column(Integer, nullable=True)
     prune_freq: Mapped[int | None] = mapped_column(Integer, nullable=True)
     time_created: Mapped[datetime.datetime] = mapped_column(
@@ -424,7 +497,6 @@ class Connector(Base):
     time_updated: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
-    disabled: Mapped[bool] = mapped_column(Boolean, default=False)
 
     credentials: Mapped[list["ConnectorCredentialPair"]] = relationship(
         "ConnectorCredentialPair",
@@ -434,13 +506,16 @@ class Connector(Base):
     documents_by_connector: Mapped[
         list["DocumentByConnectorCredentialPair"]
     ] = relationship("DocumentByConnectorCredentialPair", back_populates="connector")
-    index_attempts: Mapped[list["IndexAttempt"]] = relationship(
-        "IndexAttempt", back_populates="connector"
-    )
 
 
 class Credential(Base):
     __tablename__ = "credential"
+
+    name: Mapped[str] = mapped_column(String, nullable=True)
+
+    source: Mapped[DocumentSource] = mapped_column(
+        Enum(DocumentSource, native_enum=False)
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     credential_json: Mapped[dict[str, Any]] = mapped_column(EncryptedJson())
@@ -462,9 +537,7 @@ class Credential(Base):
     documents_by_credential: Mapped[
         list["DocumentByConnectorCredentialPair"]
     ] = relationship("DocumentByConnectorCredentialPair", back_populates="credential")
-    index_attempts: Mapped[list["IndexAttempt"]] = relationship(
-        "IndexAttempt", back_populates="credential"
-    )
+
     user: Mapped[User | None] = relationship("User", back_populates="credentials")
 
 
@@ -516,12 +589,16 @@ class EmbeddingModel(Base):
           cloud_provider='{self.cloud_provider.name if self.cloud_provider else 'None'}')>"
 
     @property
-    def api_key(self) -> str | None:
-        return self.cloud_provider.api_key if self.cloud_provider else None
+    def provider_type(self) -> EmbeddingProvider | None:
+        return (
+            EmbeddingProvider(self.cloud_provider.name.lower())
+            if self.cloud_provider is not None
+            else None
+        )
 
     @property
-    def provider_type(self) -> str | None:
-        return self.cloud_provider.name if self.cloud_provider else None
+    def api_key(self) -> str | None:
+        return self.cloud_provider.api_key if self.cloud_provider is not None else None
 
 
 class IndexAttempt(Base):
@@ -534,13 +611,10 @@ class IndexAttempt(Base):
     __tablename__ = "index_attempt"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    connector_id: Mapped[int | None] = mapped_column(
-        ForeignKey("connector.id"),
-        nullable=True,
-    )
-    credential_id: Mapped[int | None] = mapped_column(
-        ForeignKey("credential.id"),
-        nullable=True,
+
+    connector_credential_pair_id: Mapped[int] = mapped_column(
+        ForeignKey("connector_credential_pair.id"),
+        nullable=False,
     )
 
     # Some index attempts that run from beginning will still have this as False
@@ -578,12 +652,10 @@ class IndexAttempt(Base):
         onupdate=func.now(),
     )
 
-    connector: Mapped[Connector] = relationship(
-        "Connector", back_populates="index_attempts"
+    connector_credential_pair: Mapped[ConnectorCredentialPair] = relationship(
+        "ConnectorCredentialPair", back_populates="index_attempts"
     )
-    credential: Mapped[Credential] = relationship(
-        "Credential", back_populates="index_attempts"
-    )
+
     embedding_model: Mapped[EmbeddingModel] = relationship(
         "EmbeddingModel", back_populates="index_attempts"
     )
@@ -591,8 +663,7 @@ class IndexAttempt(Base):
     __table_args__ = (
         Index(
             "ix_index_attempt_latest_for_connector_credential_pair",
-            "connector_id",
-            "credential_id",
+            "connector_credential_pair_id",
             "time_created",
         ),
     )
@@ -600,7 +671,6 @@ class IndexAttempt(Base):
     def __repr__(self) -> str:
         return (
             f"<IndexAttempt(id={self.id!r}, "
-            f"connector_id={self.connector_id!r}, "
             f"status={self.status!r}, "
             f"error_msg={self.error_msg!r})>"
             f"time_created={self.time_created!r}, "
@@ -670,6 +740,9 @@ class SearchDoc(Base):
         postgresql.ARRAY(String), nullable=True
     )
     is_internet: Mapped[bool] = mapped_column(Boolean, default=False, nullable=True)
+
+    is_relevant: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    relevance_explanation: Mapped[str | None] = mapped_column(String, nullable=True)
 
     chat_messages = relationship(
         "ChatMessage",
@@ -818,6 +891,8 @@ class ChatMessage(Base):
         secondary="chat_message__search_doc",
         back_populates="chat_messages",
     )
+    # NOTE: Should always be attached to the `assistant` message.
+    # represents the tool calls used to generate this message
     tool_calls: Mapped[list["ToolCall"]] = relationship(
         "ToolCall",
         back_populates="message",
@@ -920,6 +995,11 @@ class LLMProvider(Base):
     default_model_name: Mapped[str] = mapped_column(String)
     fast_default_model_name: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Models to actually disp;aly to users
+    # If nulled out, we assume in the application logic we should present all
+    display_model_names: Mapped[list[str] | None] = mapped_column(
+        postgresql.ARRAY(String), nullable=True
+    )
     # The LLMs that are available for this provider. Only required if not a default provider.
     # If a default provider, then the LLM options are pulled from the `options.py` file.
     # If needed, can be pulled out as a separate table in the future.
@@ -929,6 +1009,13 @@ class LLMProvider(Base):
 
     # should only be set for a single provider
     is_default_provider: Mapped[bool | None] = mapped_column(Boolean, unique=True)
+    # EE only
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    groups: Mapped[list["UserGroup"]] = relationship(
+        "UserGroup",
+        secondary="llm_provider__user_group",
+        viewonly=True,
+    )
 
 
 class CloudEmbeddingProvider(Base):
@@ -1068,10 +1155,6 @@ class Persona(Base):
     user_id: Mapped[UUID | None] = mapped_column(ForeignKey("user.id"), nullable=True)
     name: Mapped[str] = mapped_column(String)
     description: Mapped[str] = mapped_column(String)
-    # Currently stored but unused, all flows use hybrid
-    search_type: Mapped[SearchType] = mapped_column(
-        Enum(SearchType, native_enum=False), default=SearchType.HYBRID
-    )
     # Number of chunks to pass to the LLM for generation.
     num_chunks: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Pass every chunk through LLM for evaluation, fairly expensive
@@ -1104,9 +1187,14 @@ class Persona(Base):
     # controls the ordering of personas in the UI
     # higher priority personas are displayed first, ties are resolved by the ID,
     # where lower value IDs (e.g. created earlier) are displayed first
-    display_priority: Mapped[int] = mapped_column(Integer, nullable=True, default=None)
+    display_priority: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=None
+    )
     deleted: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    uploaded_image_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    icon_color: Mapped[str | None] = mapped_column(String, nullable=True)
+    icon_shape: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # These are only defaults, users can select from all if desired
     prompts: Mapped[list[Prompt]] = relationship(
@@ -1134,6 +1222,7 @@ class Persona(Base):
         viewonly=True,
     )
     # EE only
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     groups: Mapped[list["UserGroup"]] = relationship(
         "UserGroup",
         secondary="persona__user_group",
@@ -1320,7 +1409,9 @@ class User__UserGroup(Base):
     user_group_id: Mapped[int] = mapped_column(
         ForeignKey("user_group.id"), primary_key=True
     )
-    user_id: Mapped[UUID] = mapped_column(ForeignKey("user.id"), primary_key=True)
+    user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user.id"), primary_key=True, nullable=True
+    )
 
 
 class UserGroup__ConnectorCredentialPair(Base):
@@ -1352,6 +1443,17 @@ class Persona__UserGroup(Base):
     __tablename__ = "persona__user_group"
 
     persona_id: Mapped[int] = mapped_column(ForeignKey("persona.id"), primary_key=True)
+    user_group_id: Mapped[int] = mapped_column(
+        ForeignKey("user_group.id"), primary_key=True
+    )
+
+
+class LLMProvider__UserGroup(Base):
+    __tablename__ = "llm_provider__user_group"
+
+    llm_provider_id: Mapped[int] = mapped_column(
+        ForeignKey("llm_provider.id"), primary_key=True
+    )
     user_group_id: Mapped[int] = mapped_column(
         ForeignKey("user_group.id"), primary_key=True
     )

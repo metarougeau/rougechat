@@ -1,10 +1,10 @@
 from functools import partial
-from itertools import chain
 from typing import Protocol
 
 from sqlalchemy.orm import Session
 
 from danswer.access.access import get_access_for_documents
+from danswer.configs.app_configs import ENABLE_MULTIPASS_INDEXING
 from danswer.configs.constants import DEFAULT_BOOST
 from danswer.connectors.cross_connector_utils.miscellaneous_utils import (
     get_experts_stores_representations,
@@ -22,10 +22,10 @@ from danswer.db.tag import create_or_add_document_tag_list
 from danswer.document_index.interfaces import DocumentIndex
 from danswer.document_index.interfaces import DocumentMetadata
 from danswer.indexing.chunker import Chunker
-from danswer.indexing.chunker import DefaultChunker
 from danswer.indexing.embedder import IndexingEmbedder
 from danswer.indexing.models import DocAwareChunk
 from danswer.indexing.models import DocMetadataAwareIndexChunk
+from danswer.search.search_settings import get_search_settings
 from danswer.utils.logger import setup_logger
 from danswer.utils.timing import log_function_time
 
@@ -34,7 +34,9 @@ logger = setup_logger()
 
 class IndexingPipelineProtocol(Protocol):
     def __call__(
-        self, documents: list[Document], index_attempt_metadata: IndexAttemptMetadata
+        self,
+        document_batch: list[Document],
+        index_attempt_metadata: IndexAttemptMetadata,
     ) -> tuple[int, int]:
         ...
 
@@ -116,7 +118,7 @@ def index_doc_batch(
     chunker: Chunker,
     embedder: IndexingEmbedder,
     document_index: DocumentIndex,
-    documents: list[Document],
+    document_batch: list[Document],
     index_attempt_metadata: IndexAttemptMetadata,
     db_session: Session,
     ignore_time_skip: bool = False,
@@ -124,6 +126,32 @@ def index_doc_batch(
     """Takes different pieces of the indexing pipeline and applies it to a batch of documents
     Note that the documents should already be batched at this point so that it does not inflate the
     memory requirements"""
+    documents = []
+    for document in document_batch:
+        empty_contents = not any(section.text.strip() for section in document.sections)
+        if (
+            (not document.title or not document.title.strip())
+            and not document.semantic_identifier.strip()
+            and empty_contents
+        ):
+            # Skip documents that have neither title nor content
+            # If the document doesn't have either, then there is no useful information in it
+            # This is again verified later in the pipeline after chunking but at that point there should
+            # already be no documents that are empty.
+            logger.warning(
+                f"Skipping document with ID {document.id} as it has neither title nor content."
+            )
+        elif (
+            document.title is not None and not document.title.strip() and empty_contents
+        ):
+            # The title is explicitly empty ("" and not None) and the document is empty
+            # so when building the chunk text representation, it will be empty and unuseable
+            logger.warning(
+                f"Skipping document with ID {document.id} as the chunks will be empty."
+            )
+        else:
+            documents.append(document)
+
     document_ids = [document.id for document in documents]
     db_docs = get_documents_by_ids(
         document_ids=document_ids,
@@ -138,6 +166,11 @@ def index_doc_batch(
         if not ignore_time_skip
         else documents
     )
+
+    # No docs to update either because the batch is empty or every doc was already indexed
+    if not updatable_docs:
+        return 0, 0
+
     updatable_ids = [doc.id for doc in updatable_docs]
 
     # Create records in the source of truth about these documents,
@@ -149,14 +182,18 @@ def index_doc_batch(
     )
 
     logger.debug("Starting chunking")
-
-    # The first chunk additionally contains the Title of the Document
-    chunks: list[DocAwareChunk] = list(
-        chain(*[chunker.chunk(document=document) for document in updatable_docs])
-    )
+    chunks: list[DocAwareChunk] = []
+    for document in updatable_docs:
+        chunks.extend(chunker.chunk(document=document))
 
     logger.debug("Starting embedding")
-    chunks_with_embeddings = embedder.embed_chunks(chunks=chunks)
+    chunks_with_embeddings = (
+        embedder.embed_chunks(
+            chunks=chunks,
+        )
+        if chunks
+        else []
+    )
 
     # Acquires a lock on the documents so that no other process can modify them
     # NOTE: don't need to acquire till here, since this is when the actual race condition
@@ -191,7 +228,7 @@ def index_doc_batch(
         ]
 
         logger.debug(
-            f"Indexing the following chunks: {[chunk.to_short_descriptor() for chunk in chunks]}"
+            f"Indexing the following chunks: {[chunk.to_short_descriptor() for chunk in access_aware_chunks]}"
         )
         # A document will not be spread across different batches, so all the
         # documents with chunks in this set, are fully represented by the chunks
@@ -215,7 +252,7 @@ def index_doc_batch(
         )
 
     return len([r for r in insertion_records if r.already_existed is False]), len(
-        chunks
+        access_aware_chunks
     )
 
 
@@ -227,8 +264,28 @@ def build_indexing_pipeline(
     chunker: Chunker | None = None,
     ignore_time_skip: bool = False,
 ) -> IndexingPipelineProtocol:
-    """Builds a pipline which takes in a list (batch) of docs and indexes them."""
-    chunker = chunker or DefaultChunker()
+    """Builds a pipeline which takes in a list (batch) of docs and indexes them."""
+    search_settings = get_search_settings()
+    multipass = (
+        search_settings.multipass_indexing
+        if search_settings
+        else ENABLE_MULTIPASS_INDEXING
+    )
+    enable_large_chunks = multipass and (
+        embedder.provider_type is not None or embedder.model_name.startswith("nomic-ai")
+    )
+
+    if multipass and not enable_large_chunks:
+        logger.warning(
+            "Multipass indexing is enabled, but the provider type or model name"
+            " is not supported. Only mini chunks will be indexed."
+        )
+
+    chunker = chunker or Chunker(
+        tokenizer=embedder.embedding_model.tokenizer,
+        enable_multipass=multipass,
+        enable_large_chunks=enable_large_chunks,
+    )
 
     return partial(
         index_doc_batch,
